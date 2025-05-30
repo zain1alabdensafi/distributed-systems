@@ -59,17 +59,14 @@ public class Node {
     private void handleRequest(Socket clientSocket) {
         try {
             clientSocket.setSoTimeout(20000);
-            // 1. إنشاء تيارات الإدخال/الإخراج أولاً
             ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream());
             ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream());
 
-            // 2. قراءة الأمر الأساسي
             String command = (String) in.readObject();
             if (command == null) {
                 return;
             }
 
-            // 3. معالجة الأوامر المختلفة
             switch (command) {
                 case "UPLOAD", "UPDATE", "SYNC" -> {
                     String filename = (String) in.readObject();
@@ -139,10 +136,10 @@ public class Node {
                 }
             }
 
-        } catch (EOFException e) {
-            System.out.println("Connection reset by client");
+        } catch (SocketException | EOFException ignored) {
+            // تجاهل الخطأ الناتج عن إغلاق الاتصال من جهة العميل
         } catch (Exception e) {
-            System.err.println("Error handling request: " + e.getClass().getName() + ": " + e.getMessage());
+            System.err.println("Unexpected error handling request: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         } finally {
             try {
                 clientSocket.close();

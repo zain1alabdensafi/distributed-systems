@@ -1,22 +1,25 @@
 package Coordinator;
 
+import Department.DepartmentManager;
 import java.io.*;
-import java.net.Socket;
-import java.rmi.RemoteException;
-import java.rmi.registry.LocateRegistry;
-import java.rmi.registry.Registry;
-import java.rmi.server.UnicastRemoteObject;
+import java.net.*;
+import java.rmi.*;
+import java.rmi.registry.*;
+import java.rmi.server.*;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
 
 public class Coordinator extends UnicastRemoteObject implements CoordinatorInterface {
+    // البيانات الأساسية
     private final Set<String> departments = new HashSet<>(Arrays.asList("development", "design", "OA"));
-
-    private final Map<String, User> users;
-    private final Map<String, String> tokens;
-    private final List<String> activeNodes;
-    private final AtomicInteger currentIndex = new AtomicInteger(0);
+    private final Map<String, User> users = new ConcurrentHashMap<>();
+    private final Map<String, String> tokens = new ConcurrentHashMap<>();
+    private final List<String> activeNodes = new CopyOnWriteArrayList<>();
+    private final Set<String> failedNodes = ConcurrentHashMap.newKeySet();
+    private final Map<String, AtomicInteger> nodeLoads = new ConcurrentHashMap<>();
     private static final int NODE_TIMEOUT = 3000;
+    private static final int HEALTH_CHECK_INTERVAL = 10000;
 
     static class User {
         String password;
@@ -30,144 +33,111 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
         }
     }
 
-    protected Coordinator() throws RemoteException {
+    // Constructor
+    public Coordinator() throws RemoteException {
         super();
-        users = new HashMap<>();
-        tokens = new HashMap<>();
-        activeNodes = new ArrayList<>(Arrays.asList(
+        // Initialize nodes
+        activeNodes.addAll(Arrays.asList(
                 "localhost:5001",
                 "localhost:5002",
                 "localhost:5003"
         ));
 
-        // Initialize admin and sample users
+        // Initialize node loads
+        activeNodes.forEach(node -> nodeLoads.put(node, new AtomicInteger(0)));
+
+        // Initialize default users
         users.put("admin", new User("admin123", "manager", "ALL"));
         users.put("dev1", new User("dev123", "employee", "development"));
         users.put("design1", new User("design123", "employee", "design"));
+
+        startHealthCheckThread();
     }
 
-    // Implementation of all interface methods...
-    // [يحتوي على جميع الدوال المذكورة في الإجابة السابقة]
-
-    @Override
-    public boolean addDepartment(String departmentName, String token) throws RemoteException {
-        if (!isAdmin(token)) return false;
-        return departments.add(departmentName.toLowerCase());
+    // ==================== إدارة العقد ====================
+    private String selectLeastLoadedNode() {
+        return activeNodes.stream()
+                .min(Comparator.comparingInt(node -> nodeLoads.get(node).get()))
+                .orElseThrow(() -> new RuntimeException("No active nodes available"));
     }
 
-    @Override
-    public boolean removeDepartment(String departmentName, String token) throws RemoteException {
-        if (!isAdmin(token)) return false;
-        return departments.remove(departmentName.toLowerCase());
-    }
-
-    @Override
-    public List<String> listDepartments(String token) throws RemoteException {
-        if (!isValidToken(token)) return Collections.emptyList();
-        return new ArrayList<>(departments);
-    }
-    private boolean isValidToken(String token) {
-        return token != null && tokens.containsKey(token);
-    }
-
-    private boolean isAdmin(String token) {
-        String username = getUsernameFromToken(token);
-        User user = users.get(username);
-        return user != null && "manager".equals(user.role);
-    }
-
-
-    @Override
-    public synchronized boolean registerUser(String username, String password, String role, String department) throws RemoteException {
-        if (users.containsKey(username)) {
+    private void checkFailedNodes() {
+        failedNodes.removeIf(node -> {
+            if (isNodeAlive(node)) {
+                activeNodes.add(node);
+                nodeLoads.putIfAbsent(node, new AtomicInteger(0));
+                System.out.println("[Health] Node " + node + " is back online");
+                return true;
+            }
             return false;
-        }
-        users.put(username, new User(password, role, department));
-        return true;
+        });
     }
 
-    @Override
-    public synchronized String loginUser(String username, String password) throws RemoteException {
-        User user = users.get(username);
-        if (user != null && user.password.equals(password)) {
-            String token = UUID.randomUUID().toString();
-            tokens.put(token, username);
-            return token;
-        }
-        return null;
-    }
-
-    private String getUsernameFromToken(String token) {
-        return tokens.get(token);
-    }
-
-    private boolean hasPermission(String token, String department) {
-        String username = getUsernameFromToken(token);
-        if (username == null) return false;
-
-        User user = users.get(username);
-        return user != null &&
-                (user.department.equals(department) ||
-                        user.department.equals("ALL") ||
-                        user.role.equals("manager"));
-    }
-
-    private String selectNode() {
-        if (activeNodes.isEmpty()) {
-            throw new RuntimeException("No active nodes available");
-        }
-
-        int index = currentIndex.getAndIncrement() % activeNodes.size();
-        return activeNodes.get(index);
+    private void startHealthCheckThread() {
+        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
+            try {
+                checkFailedNodes();
+                activeNodes.removeIf(node -> !isNodeAlive(node));
+                System.out.println("[Health] Active nodes: " + activeNodes);
+            } catch (Exception e) {
+                System.err.println("[Health Error] " + e.getMessage());
+            }
+        }, HEALTH_CHECK_INTERVAL, HEALTH_CHECK_INTERVAL, TimeUnit.MILLISECONDS);
     }
 
     private boolean isNodeAlive(String node) {
         try {
             String[] parts = node.split(":");
             Socket socket = new Socket();
-            socket.connect(new java.net.InetSocketAddress(parts[0], Integer.parseInt(parts[1])), NODE_TIMEOUT);
+            socket.connect(new InetSocketAddress(parts[0], Integer.parseInt(parts[1])), NODE_TIMEOUT);
             socket.close();
             return true;
         } catch (IOException e) {
-            activeNodes.remove(node);
-            System.err.println("Node " + node + " is down. Removing from active nodes.");
+            failedNodes.add(node);
+            nodeLoads.remove(node);
+            System.err.println("[Failure] Node " + node + " is down");
             return false;
         }
     }
 
-    private byte[] tryRequestFromNodes(String command, String filename, String department) {
-        for (String node : new ArrayList<>(activeNodes)) {
-            if (!isNodeAlive(node)) continue;
+    // ==================== الوظائف الأساسية ====================
+    @Override
+    public boolean registerUser(String username, String password, String role, String department) throws RemoteException {
+        if (users.containsKey(username)) return false;
+        users.put(username, new User(password, role, department));
+        return true;
+    }
 
-            try {
-                byte[] data = requestFromNode(node, command, filename, department);
-                if (data != null) return data;
-            } catch (Exception e) {
-                System.err.println("Error requesting from node " + node + ": " + e.getMessage());
-            }
+    @Override
+    public String loginUser(String username, String password) throws RemoteException {
+        User user = users.get(username);
+        if (user != null && user.password.equals(password)) {
+            String token = UUID.randomUUID().toString();
+            tokens.put(token, username);
+            System.out.println("[Login] User '" + username + "' logged in. Token: " + token);
+            return token;
         }
+        System.out.println("[Login Failed] Invalid login attempt for user: " + username);
         return null;
     }
 
-    private boolean trySendToNodes(String command, String filename, byte[] data, String department) {
-        boolean success = false;
-        for (String node : new ArrayList<>(activeNodes)) {
-            if (!isNodeAlive(node)) continue;
-
-            try {
-                success |= sendToNode(node, command, filename, data, department);
-            } catch (Exception e) {
-                System.err.println("Error sending to node " + node + ": " + e.getMessage());
-            }
-        }
-        return success;
-    }
 
     @Override
     public byte[] requestFile(String filename, String department, String token) throws RemoteException {
         if (!hasPermission(token, department)) return null;
-        return tryRequestFromNodes("DOWNLOAD", filename, department);
+
+        String node = selectLeastLoadedNode();
+        nodeLoads.get(node).incrementAndGet();
+        try {
+            return requestFromNode(node, "DOWNLOAD", filename, department);
+        } catch (IOException e) {
+            e.printStackTrace(); // أو سجل الخطأ باستخدام Logger
+            return null;
+        } finally {
+            nodeLoads.get(node).decrementAndGet();
+        }
     }
+
 
     @Override
     public boolean uploadFile(String filename, byte[] data, String department, String token) throws RemoteException {
@@ -193,7 +163,8 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
 
         for (String node : activeNodes) {
             try {
-                return requestFileListFromNode(node, department);
+                List<String> files = requestFileListFromNode(node, department);
+                if (files != null && !files.isEmpty()) return files;
             } catch (Exception e) {
                 System.err.println("Error listing files from node " + node + ": " + e.getMessage());
             }
@@ -206,19 +177,39 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
         return trySendToNodes("SYNC", filename, data, department);
     }
 
-    private byte[] requestFromNode(String node, String command, String filename, String department) throws IOException {
-        String[] parts = node.split(":");
-        try (Socket socket = new Socket(parts[0], Integer.parseInt(parts[1]));
-             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+    // ==================== إدارة الأقسام ====================
+    @Override
+    public boolean addDepartment(String departmentName, String token) throws RemoteException {
+        if (!isAdmin(token)) return false;
+        return departments.add(departmentName.toLowerCase());
+    }
 
-            out.writeObject(command);
-            out.writeObject(filename);
-            out.writeObject(department);
-            return (byte[]) in.readObject();
-        } catch (ClassNotFoundException e) {
-            throw new IOException(e);
+    @Override
+    public boolean removeDepartment(String departmentName, String token) throws RemoteException {
+        if (!isAdmin(token)) return false;
+        return departments.remove(departmentName.toLowerCase());
+    }
+
+    @Override
+    public List<String> listDepartments(String token) throws RemoteException {
+        if (!isValidToken(token)) return Collections.emptyList();
+        return new ArrayList<>(departments);
+    }
+
+    // ==================== الدوال المساعدة ====================
+    private boolean trySendToNodes(String command, String filename, byte[] data, String department) {
+        boolean success = false;
+        for (String node : activeNodes) {
+            nodeLoads.get(node).incrementAndGet();
+            try {
+                success |= sendToNode(node, command, filename, data, department);
+            } catch (Exception e) {
+                System.err.println("Error sending to node " + node + ": " + e.getMessage());
+            } finally {
+                nodeLoads.get(node).decrementAndGet();
+            }
         }
+        return success;
     }
 
     private boolean sendToNode(String node, String command, String filename, byte[] data, String department) throws IOException {
@@ -231,7 +222,6 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
             out.writeObject(filename);
             out.writeObject(department);
             if (data != null) out.writeObject(data);
-
             return in.readBoolean();
         }
     }
@@ -250,26 +240,49 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
         }
     }
 
+    private boolean isAdmin(String token) {
+        String username = tokens.get(token);
+        User user = users.get(username);
+        return user != null && "manager".equals(user.role);
+    }
+
+    private boolean isValidToken(String token) {
+        return token != null && tokens.containsKey(token);
+    }
+
+    private boolean hasPermission(String token, String department) {
+        String username = tokens.get(token);
+        if (username == null) return false;
+
+        User user = users.get(username);
+        return user != null &&
+                (user.department.equals(department) ||
+                        user.department.equals("ALL") ||
+                        user.role.equals("manager"));
+    }
+    private byte[] requestFromNode(String node, String command, String filename, String department) throws IOException {
+        String[] parts = node.split(":");
+        try (Socket socket = new Socket(parts[0], Integer.parseInt(parts[1]));
+             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+            out.writeObject(command);
+            out.writeObject(filename);
+            out.writeObject(department);
+            return (byte[]) in.readObject();
+        } catch (ClassNotFoundException e) {
+            throw new IOException(e);
+        }
+    }
+    // ==================== Main Method ====================
     public static void main(String[] args) {
         try {
             Coordinator coordinator = new Coordinator();
             Registry registry = LocateRegistry.createRegistry(1099);
             registry.rebind("CoordinatorService", coordinator);
-            System.out.println("Coordinator RMI Server is running...");
-
-            // Health check thread
-            new Thread(() -> {
-                while (true) {
-                    try {
-                        Thread.sleep(10000);
-                        coordinator.activeNodes.removeIf(node -> !coordinator.isNodeAlive(node));
-                        System.out.println("Active nodes: " + coordinator.activeNodes);
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                }
-            }).start();
+            System.out.println("Coordinator service started successfully");
         } catch (Exception e) {
+            System.err.println("Coordinator startup failed: " + e.getMessage());
             e.printStackTrace();
         }
     }

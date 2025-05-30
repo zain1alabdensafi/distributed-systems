@@ -87,38 +87,45 @@ public class Client {
             System.out.println("\nMain Menu:");
             System.out.println("1. Upload File");
             System.out.println("2. Download File");
-        System.out.println("3. Update File");
-        System.out.println("4. Delete File");
-        System.out.println("5. List Files");
-        System.out.println("6. Logout");
+            System.out.println("3. Update File");
+            System.out.println("4. Delete File");
+            System.out.println("5. List Files");
+
             if (isAdmin) {
-                System.out.println("7. Admin Panel");
+                System.out.println("6. Admin Panel");
+                System.out.println("7. Logout");
+            } else {
+                System.out.println("6. Logout");
             }
-            System.out.println("8. Logout");
+
             System.out.print("Choose option: ");
-        System.out.print("Choose option: ");
+            int choice = Integer.parseInt(scanner.nextLine());
 
-        int choice = Integer.parseInt(scanner.nextLine());
-
-        switch (choice) {
-            case 1 -> uploadFile(scanner);
-            case 2 -> downloadFile(scanner);
-            case 3 -> updateFile(scanner);
-            case 4 -> deleteFile(scanner);
-            case 5 -> listFiles(scanner);
-            case 7 -> {
-                if (isAdmin) {
-                    showAdminMenu(scanner);
+            switch (choice) {
+                case 1 -> uploadFile(scanner);
+                case 2 -> downloadFile(scanner);
+                case 3 -> updateFile(scanner);
+                case 4 -> deleteFile(scanner);
+                case 5 -> listFiles(scanner);
+                case 6 -> {
+                    if (isAdmin) {
+                        showAdminMenu(scanner);
+                    } else {
+                        token = null;
+                        currentUser = null;
+                        return;
+                    }
                 }
+                case 7 -> {
+                    if (isAdmin) {
+                        token = null;
+                        currentUser = null;
+                        return;
+                    }
+                }
+                default -> System.out.println("Invalid option!");
             }
-            case 8 -> {
-                token = null;
-                currentUser = null;
-                return;
-            }
-            default -> System.out.println("Invalid option!");
         }
-    }
     }
 
     private static void uploadFile(Scanner scanner) {
